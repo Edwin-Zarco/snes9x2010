@@ -52,6 +52,23 @@ jobs:
           sed -i '/^include \$(BUILD_SHARED_LIBRARY)/i LOCAL_ARM_MODE := arm' jni/Android.mk
           grep -q 'LOCAL_ARM_MODE' jni/Android.mk
 
+          # posix_fadvise/posix_fallocate only exist in bionic from API 21.
+          # They're optional hints in libretro-common's VFS copy path, so
+          # no-op them for old targets (force-included into every C file).
+          cat > jni/old_android_compat.h <<'COMPAT'
+          #ifndef OLD_ANDROID_COMPAT_H
+          #define OLD_ANDROID_COMPAT_H
+          #if defined(__ANDROID__) && __ANDROID_API__ < 21
+          #include <sys/types.h>
+          static inline int posix_fadvise(int fd, off_t off, off_t len, int advice)
+          { (void)fd; (void)off; (void)len; (void)advice; return 0; }
+          static inline int posix_fallocate(int fd, off_t off, off_t len)
+          { (void)fd; (void)off; (void)len; return 0; }
+          #endif
+          #endif
+          COMPAT
+          sed -i 's/^          //' jni/old_android_compat.h
+
           cat > jni/Application.mk <<'APPMK'
           APP_ABI      := armeabi-v7a
           APP_PLATFORM := android-16
@@ -63,6 +80,7 @@ jobs:
                           -fvisibility=hidden -fno-plt \
                           -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
                           -mcpu=cortex-a8 -mfpu=neon -mfloat-abi=softfp \
+                          -include @COMPAT@ \
                           -flto -DNDEBUG
           # --hash-style=both : Android 4.0's linker only understands DT_HASH
           #                     (lld defaults to DT_GNU_HASH only)
@@ -71,6 +89,7 @@ jobs:
           APPMK
           # strip the heredoc indentation
           sed -i 's/^          //' jni/Application.mk
+          sed -i "s|@COMPAT@|$PWD/jni/old_android_compat.h|" jni/Application.mk
           cat jni/Application.mk
 
       - name: Build (ndk-build)
