@@ -1,15 +1,12 @@
-# Place at .github/workflows/build-xperia-play.yml in the snes9x2010 repo root.
-#
-# Official libretro Android build = `cd jni && ndk-build` (jni/Android.mk).
-# Tweaks on top of that:
-#   - NDK r23c, armeabi-v7a only, APP_PLATFORM=android-16
-#   - Xperia Play (Snapdragon S2 / Scorpion): ARMv7-A, NEON, VFPv3, ARM mode
-#   - Android 4.0 linker: SysV .hash table, no packed relocs
-#   - Old-API shims for posix_fadvise/posix_fallocate
-#   - Warning cleanup: clang-compatible optnone for save-state code,
-#     unary-minus spacing in dsp.c, and suppressed invalid-encoding warning
-#     for the Turkish option label (file left unmodified)
-name: Build snes9x2010 (Xperia Play / Android 4.0.4)
+# BASELINE build: stock libretro flags, no performance tuning, no source patches.
+# Purpose: confirm the core runs on the Xperia Play before optimizing.
+# Kept only what is required to link and load on Android 4.0:
+#   - API 16 target (NDK r23c minimum)
+#   - compat shim for posix_fadvise/posix_fallocate (missing from API 16 libc)
+#   - --hash-style=both (Android 4.0 linker needs DT_HASH)
+# Everything else uses the NDK defaults: ARMv7 with VFPv3-D16 (no forced NEON),
+# default ARM/Thumb selection, default -O2, no LTO.
+name: Build snes9x2010 baseline (Xperia Play)
 
 on:
   push:
@@ -19,9 +16,6 @@ on:
 env:
   NDK_VERSION: r23c
   NDK_URL: https://dl.google.com/android/repository/android-ndk-r23c-linux.zip
-  # NDK r23c's minimum is API 16 (Android 4.1). Android 4.0.x is API 15 and
-  # cannot be targeted; the core only needs libc/libm/libdl, so it loads.
-  API: 16
 
 jobs:
   build:
@@ -29,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0   # Android.mk calls `git rev-parse` for GIT_VERSION
+          fetch-depth: 0
 
       - name: Cache NDK r23c
         id: ndk-cache
@@ -44,27 +38,11 @@ jobs:
           curl -fsSL -o /tmp/ndk.zip "$NDK_URL"
           unzip -q /tmp/ndk.zip -d "$HOME"
 
-      - name: Configure for Xperia Play
+      - name: Configure baseline
         run: |
           echo "ANDROID_NDK_HOME=$HOME/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
           echo "$HOME/android-ndk-${NDK_VERSION}" >> "$GITHUB_PATH"
 
-          # ---- Warning cleanup -------------------------------------------
-          # clang ignores __attribute__((optimize(0))) (a GCC-only attribute),
-          # so the save-state functions were being built optimized. Use the
-          # clang equivalent. noinline is required alongside optnone.
-          sed -i 's/__attribute__((optimize(0)))/__attribute__((noinline, optnone))/' src/apu.c
-          grep -q 'optnone' src/apu.c || { echo "::error::optnone patch failed"; exit 1; }
-
-          # dsp.c has `C11 =- (expr)`, which is `C11 = -(expr)`. Same meaning,
-          # written with spacing so clang doesn't warn about a possible `-=`.
-          sed -i -E 's/(C(11|8|9)[ ]+)=-[ ]*\(/\1= -(/' src/dsp.c
-          grep -qE 'C11 = -\(' src/dsp.c || { echo "::error::dsp.c patch failed"; exit 1; }
-
-          # ---- Old-API shim ----------------------------------------------
-          # posix_fadvise/posix_fallocate exist in bionic only from API 21.
-          # They're optional hints in libretro-common's VFS copy path, so
-          # they become no-ops for old targets (force-included into C files).
           cat > jni/old_android_compat.h <<'COMPAT'
           #ifndef OLD_ANDROID_COMPAT_H
           #define OLD_ANDROID_COMPAT_H
@@ -79,31 +57,16 @@ jobs:
           COMPAT
           sed -i 's/^          //' jni/old_android_compat.h
 
-          # ---- Application.mk --------------------------------------------
           cat > jni/Application.mk <<'APPMK'
           APP_ABI      := armeabi-v7a
           APP_PLATFORM := android-16
           APP_STL      := none
           APP_OPTIM    := release
-          APP_CFLAGS   := -O3 -fno-stack-protector -fomit-frame-pointer \
-                          -fno-unwind-tables -fno-asynchronous-unwind-tables \
-                          -ffunction-sections -fdata-sections \
-                          -fvisibility=hidden -fno-plt \
-                          -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
-                          -mcpu=cortex-a8 -mfpu=neon -mfloat-abi=softfp \
-                          -include @COMPAT@ \
-                          -Wno-invalid-source-encoding \
-                          -flto -DNDEBUG
-          # --hash-style=both : Android 4.0's linker only understands DT_HASH
-          APP_LDFLAGS  := -flto -Wl,--gc-sections -Wl,--hash-style=both \
-                          -Wl,--no-undefined -Wl,-z,noexecstack -Wl,-O2
+          APP_CFLAGS   := -include @COMPAT@
+          APP_LDFLAGS  := -Wl,--hash-style=both
           APPMK
           sed -i 's/^          //' jni/Application.mk
           sed -i "s|@COMPAT@|$PWD/jni/old_android_compat.h|" jni/Application.mk
-
-          # Hot code in ARM mode (faster than Thumb-2 on in-order Scorpion/A8)
-          sed -i '/^include \$(BUILD_SHARED_LIBRARY)/i LOCAL_ARM_MODE := arm' jni/Android.mk
-          grep -q 'LOCAL_ARM_MODE' jni/Android.mk
 
           cat jni/Application.mk
 
@@ -111,26 +74,25 @@ jobs:
         working-directory: jni
         run: ndk-build -j"$(nproc)" V=0
 
-      - name: Verify the .so is loadable on old Android
+      - name: Verify the .so
         run: |
           SO=libs/armeabi-v7a/libretro.so
           RE="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           ls -l "$SO"
           "$RE" -d "$SO" | tee /tmp/dyn.txt
           grep -qE '\((HASH)\)' /tmp/dyn.txt || { echo "::error::missing DT_HASH"; exit 1; }
-          ! grep -qE 'ANDROID_REL|RELR' /tmp/dyn.txt
           grep NEEDED /tmp/dyn.txt
           "$RE" --dyn-syms "$SO" | grep -c ' retro_'
 
       - name: Package
         run: |
           mkdir -p dist
-          cp libs/armeabi-v7a/libretro.so dist/snes9x2010_libretro_android.so
+          cp libs/armeabi-v7a/libretro.so dist/snes9x2010_libretro_android_baseline.so
           "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
-            --strip-unneeded dist/snes9x2010_libretro_android.so
+            --strip-unneeded dist/snes9x2010_libretro_android_baseline.so
           ls -l dist
 
       - uses: actions/upload-artifact@v7
         with:
-          name: snes9x2010_libretro_android-armeabi-v7a-xperia-play
-          path: dist/snes9x2010_libretro_android.so
+          name: snes9x2010_libretro_android-baseline
+          path: dist/snes9x2010_libretro_android_baseline.so
